@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "baseline": {
+    "name": "current",
+    "highMin": 80,
+    "mediumMin": 60,
+    "nonApiCap": 75,
+    "sportsGraceHours": 12
+  },
+  "candidate": {
+    "name": "stricter",
+    "highMin": 90,
+    "mediumMin": 80,
+    "nonApiCap": 70,
+    "sportsGraceHours": 1
+  },
+  "cases": [
+    {
+      "name": "sports-live-at-grace-boundary",
+      "claim": { "id": 811, "category": "sports", "deadline": 1800000000 },
+      "evidence": {
+        "text": "Live: match in progress, quarter 3.",
+        "fetcher": "jina",
+        "sourceUrl": "https://scores.example/game/811",
+        "capturedAt": 1800003600000
+      },
+      "verdict": {
+        "verdict": "CREATOR_WINS",
+        "confidence": 91,
+        "explanation": "Captured model verdict from the original evaluation."
+      },
+      "now": 1800003600
+    },
+    {
+      "name": "sports-live-after-candidate-grace",
+      "claim": { "id": 812, "category": "sports", "deadline": 1800000000 },
+      "evidence": {
+        "text": "Live: match still in progress.",
+        "fetcher": "coingecko-api",
+        "sourceUrl": "https://scores.example/game/812",
+        "capturedAt": 1800003600000
+      },
+      "verdict": {
+        "verdict": "CREATOR_WINS",
+        "confidence": 91,
+        "explanation": "Captured model verdict from the original evaluation."
+      },
+      "now": 1800003601
+    },
+    {
+      "name": "crypto-high-confidence-threshold",
+      "claim": { "id": 813, "category": "crypto", "deadline": 1800000000 },
+      "evidence": {
+        "text": "Final result confirmed by both primary feeds.",
+        "fetcher": "coingecko-api",
+        "sourceUrl": "https://prices.example/asset/813",
+        "capturedAt": 1800000060000
+      },
+      "verdict": {
+        "verdict": "CREATOR_WINS",
+        "confidence": 85,
+        "explanation": "Both feeds agree on the captured outcome."
+      },
+      "now": 1800000060
+    },
+    {
+      "name": "crypto-non-api-trust-cap",
+      "claim": { "id": 814, "category": "crypto", "deadline": 1800000000 },
+      "evidence": {
+        "text": "Final scoreboard mirrored by a scraped page.",
+        "fetcher": "jina",
+        "sourceUrl": "https://mirror.example/result/814",
+        "capturedAt": 1800000060000
+      },
+      "verdict": {
+        "verdict": "CHALLENGERS_WIN",
+        "confidence": 95,
+        "explanation": "The captured model verdict relied on scraped evidence."
+      },
+      "now": 1800000060
+    },
+    {
+      "name": "invalid-confidence-refund",
+      "claim": { "id": 815, "category": "crypto", "deadline": 1800000000 },
+      "evidence": {
+        "text": "Final result confirmed by the primary feed.",
+        "fetcher": "coingecko-api",
+        "sourceUrl": "https://prices.example/asset/815",
+        "capturedAt": 1800000060000
+      },
+      "verdict": {
+        "verdict": "CREATOR_WINS",
+        "confidence": 150,
+        "explanation": "Captured verdict carries an out-of-range confidence."
+      },
+      "now": 1800000060
+    }
+  ]
+}

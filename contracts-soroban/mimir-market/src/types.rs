@@ -1,7 +1,7 @@
 //! Value types for the Mimir market. Mirrors the structs and enums of
 //! `contracts/MimirV2.sol`.
 
-use soroban_sdk::{contracterror, contracttype, Address, BytesN, String};
+use soroban_sdk::{contracterror, contracttype, Address, BytesN, String, Vec};
 
 // ── Limits (mirror MimirV2.sol) ──────────────────────────────────────────────
 
@@ -19,6 +19,15 @@ pub const MAX_CHALLENGERS: u32 = 100;
 /// is NOT read by this function, which deliberately keeps the footprint O(n) in
 /// ids rather than O(n × roster-size).
 pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Maximum number of transitions returned by one `get_claim_history` page.
+///
+/// Each transition is its own persistent entry
+/// (`DataKey::ClaimHistoryEntry(claim_id, seq)`), so a page opens at most this
+/// many entries plus the claim's history head, whatever the number of
+/// challengers. Matches [`MAX_BATCH_SIZE`] so one simulated read stays inside
+/// the same footprint budget as a batch claim read.
+pub const MAX_HISTORY_PAGE_SIZE: u32 = 50;
 
 /// Decimals of the escrow token. A Stellar Asset Contract exposes every classic
 /// asset, Circle's USDC included, with exactly 7.
@@ -55,6 +64,18 @@ pub const FEE_TIMELOCK_SECONDS: u64 = 172_800; // 2 days
 /// Same delay as fee policy so participants get equal notice of trust-boundary
 /// changes that control settlement.
 pub const ORACLE_TIMELOCK_SECONDS: u64 = 172_800; // 2 days
+
+/// Post-deadline resolution expiration window, in seconds.
+///
+/// `0` means there is no post-deadline resolution expiration or permissionless
+/// timeout fallback for `Active` claims: oracle-only resolution remains
+/// authoritative after `deadline`, while unchallenged `Open` claims can still
+/// be permissionlessly cancelled via `transition_deadline` once `deadline` is
+/// reached.
+pub const RESOLUTION_EXPIRY_SECONDS: u64 = 0;
+
+/// Maximum valid oracle confidence score accepted by `resolve_claim` (0..=100).
+pub const MAX_CONFIDENCE: u32 = 100;
 
 /// Upper bound on the byte length of an invite key.
 ///
@@ -190,6 +211,10 @@ pub struct FeePolicy {
     pub platform_fee_bps: u32,
     pub agent_owner_fee_bps: u32,
     pub platform_recipient: Option<Address>,
+    /// Monotonic revision of the effective fee policy. Bumped on every
+    /// successful `execute_fee_policy`, so a recipient rotation leaves an
+    /// auditable trail of which policy (and which recipient) was in force.
+    pub revision: u64,
 }
 
 #[contracttype]
@@ -199,6 +224,10 @@ pub struct PendingFeePolicy {
     pub agent_owner_fee_bps: u32,
     pub platform_recipient: Option<Address>,
     pub executable_at: u64,
+    /// Revision the queued policy will take effect as. Fixed at queue time so
+    /// a later queue cannot silently overwrite an in-flight transition's
+    /// identity.
+    pub revision: u64,
 }
 
 #[contracttype]
@@ -314,6 +343,22 @@ pub struct Claim {
     pub fees: FeeSnapshot,
 }
 
+/// Canonical export of the fields that define what a claim asks.
+/// `source_commitment` is the claim's on-chain `context_hash`: the bytes
+/// the creator committed to at creation, not the mutable resolution URL.
+///
+/// `digest` commits to exactly the three public inputs above. Its encoding is
+/// documented on `util::claim_statement_digest` so any client can recompute it
+/// from the exported fields without trusting the contract's answer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimStatement {
+    pub question: String,
+    pub source_commitment: BytesN<32>,
+    pub deadline: u64,
+    pub digest: BytesN<32>,
+}
+
 // ── Create parameters ────────────────────────────────────────────────────────
 
 /// Mirrors `MimirV2.CreateParams`. Grouped into a struct for the same reason the
@@ -340,6 +385,142 @@ pub struct CreateParams {
     pub context_hash: BytesN<32>,
     /// `None` when the market is not attributed to an agent.
     pub agent_owner_recipient: Option<Address>,
+}
+
+// ── Claim transition preflight (#779) ───────────────────────────────────────
+
+/// Why a claim transition would be refused.
+///
+/// Structural eligibility is separated from signed execution: this enum names
+/// only what is wrong *now* with the claim as observed on chain. It says
+/// nothing about whether a subsequent signed `resolve_claim` would succeed
+/// (the oracle still has to authorize it, and the verdict still has to
+/// validate) — see [`ClaimPreflight::requires_oracle_auth`].
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreflightReason {
+    /// Claim is not `Active` (it may be Open, Resolved, or Cancelled).
+    NotActive = 0,
+    /// Claim is Active but its deadline has not yet been reached.
+    NotYetExpired = 1,
+    /// Claim id does not exist.
+    ClaimNotFound = 2,
+}
+
+/// What a read-only preflight of a claim transition would return.
+///
+/// The two booleans separate the two questions a caller needs answered:
+///
+///   - `lifecycle_ok` — is the claim, as currently stored, structurally
+///     eligible for resolution (state + deadline)? This is the exact check
+///     `resolve_claim_versioned` performs, extracted so the two cannot drift.
+///   - `requires_oracle_auth` — will a subsequent signed submission also
+///     require the oracle's authorization? Purely informational: `true` never
+///     means the submission will succeed, only that the signer is required.
+///   - `constraints_ok` — are the public, non-state constraints satisfied
+///     (a bounded resolution summary will fit, etc.)? Empty for callers that
+///     have no candidate payload, `false` only when a candidate payload would
+///     be rejected.
+///
+/// `eligible == lifecycle_ok && constraints_ok` — a convenience so a caller
+/// does not have to re-derive it.
+///
+/// **Read-only.** No `require_auth`, no storage write, no TTL bump, no event.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimPreflight {
+    pub eligible: bool,
+    pub lifecycle_ok: bool,
+    pub constraints_ok: bool,
+    pub requires_oracle_auth: bool,
+    pub missing_reasons: Vec<PreflightReason>,
+}
+
+// ── Claim history (#781) ─────────────────────────────────────────────────────
+
+/// What a recorded claim transition did.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransitionKind {
+    /// `create_claim` escrowed the creator stake. Always seq 1 when recorded.
+    Created = 0,
+    /// `challenge_claim` accepted one challenger's stake.
+    Challenged = 1,
+    /// `resolve_claim` / `resolve_claim_versioned` recorded the verdict.
+    Resolved = 2,
+    /// `cancel_claim`: the creator withdrew an unchallenged claim.
+    Cancelled = 3,
+    /// `transition_deadline`: an unchallenged claim expired and was refunded.
+    Expired = 4,
+}
+
+/// One recorded claim transition.
+///
+/// `(claim_id, seq)` is the transition's stable identity: `seq` is assigned
+/// once, strictly increasing per claim from 1, and never reused or rewritten,
+/// so a reference handed out today still names the same transition after any
+/// number of later transitions.
+///
+/// Amounts are integer USDC atomic units (7 decimals). `amount` is the stake
+/// escrowed for `Created`/`Challenged`, the refund for `Cancelled`/`Expired`,
+/// and `0` for `Resolved` (settlement amounts stay on the claim and its
+/// payout events).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimTransition {
+    pub claim_id: u64,
+    pub seq: u32,
+    pub kind: TransitionKind,
+    pub from_state: ClaimState,
+    pub to_state: ClaimState,
+    /// Creator, challenger or oracle that authorized the transition. `None`
+    /// for the permissionless `transition_deadline`.
+    pub actor: Option<Address>,
+    pub amount: i128,
+    /// Decoded verdict for `Resolved`; `WinnerSide::None` otherwise.
+    pub winner_side: WinnerSide,
+    pub ledger: u32,
+    pub timestamp: u64,
+}
+
+/// Per-claim history head, stored once per claim under
+/// `DataKey::ClaimHistoryHead(claim_id)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimHistoryHead {
+    /// Sequence number of the newest recorded transition (0 = none yet).
+    pub latest_seq: u32,
+    /// `true` when seq 1 is the claim's `Created` transition. `false` when
+    /// recording started on a claim that already existed before history was
+    /// tracked: transitions before seq 1 were never indexed on chain.
+    pub from_genesis: bool,
+}
+
+/// One bounded page of a claim's transition history.
+///
+/// Incomplete history is always explicit, never implied by an empty or short
+/// page:
+///   * `next_cursor` is `Some(c)` when transitions after this page exist;
+///     pass `c` back as `cursor` to continue. `None` means the page reached
+///     `latest_seq` as of this read.
+///   * `from_genesis == false` means transitions before seq 1 were never
+///     recorded on chain (the claim predates history tracking); reconstruct
+///     them from contract events / the read index instead.
+///   * `missing_seq == Some(s)` means entry `s` should exist but could not be
+///     read (its persistent entry was archived). The page stops BEFORE `s`
+///     rather than skipping it; `next_cursor` is then `Some(s)` (when later
+///     entries exist) so a caller may explicitly step past the gap.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimHistoryPage {
+    pub claim_id: u64,
+    pub items: Vec<ClaimTransition>,
+    /// The `cursor` this page was read after (echoed for book-keeping).
+    pub cursor: u32,
+    pub next_cursor: Option<u32>,
+    pub latest_seq: u32,
+    pub from_genesis: bool,
+    pub missing_seq: Option<u32>,
 }
 
 // ── View return shapes ───────────────────────────────────────────────────────
@@ -390,6 +571,44 @@ pub struct PlatformStats {
     pub balance: i128,
     pub fees_accrued: i128,
     pub fees_claimed: i128,
+}
+
+/// Completeness and aggregate liability for a payout preview across claim history.
+///
+/// When claim history is read across a paginated window, truncated slice, or
+/// sparse set of IDs, the preview aggregates liabilities across observed claims
+/// while explicitly reporting whether all observations were accounted for.
+///
+/// Invariant: `verified_total_liability` is `Some(amount)` ONLY when
+/// `is_complete` is true (`missing_observations == 0` and not truncated).
+/// An incomplete aggregate is NEVER presented as a verified total liability.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutPreview {
+    /// Aggregate liability computed across all observed claims in the window/slice.
+    pub aggregate_liability: i128,
+    /// Verified total liability across full claim history. Populated (`Some`)
+    /// ONLY when the preview is complete (no truncation, no missing observations).
+    /// `None` when the preview is incomplete so an incomplete aggregate is never
+    /// presented as a verified total liability.
+    pub verified_total_liability: Option<i128>,
+    /// Aggregate gross payouts across observed claims.
+    pub aggregate_gross: i128,
+    /// Aggregate fees across observed claims.
+    pub aggregate_fees: i128,
+    /// Aggregate net payouts across observed claims.
+    pub aggregate_net: i128,
+    /// Number of claims successfully observed and included in this preview.
+    pub observed_count: u32,
+    /// Total number of claims in the creator's history or requested scope.
+    pub total_claims: u32,
+    /// Number of unobserved claims (either truncated beyond the window or
+    /// missing from storage). Marked explicitly so callers can detect omissions.
+    pub missing_observations: u32,
+    /// True if the history slice was truncated by offset or limit.
+    pub is_truncated: bool,
+    /// True ONLY if all claims in history were observed and accounted for.
+    pub is_complete: bool,
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────

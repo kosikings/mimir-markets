@@ -64,11 +64,24 @@ export const LOW_CONFIDENCE_TAG = "[LOW CONFIDENCE — refunded]";
 
 export type ConfidenceTier = "high" | "medium" | "low";
 
-export function confidenceTier(confidence: number): ConfidenceTier {
-  if (confidence >= CONFIDENCE_HIGH_MIN) return "high";
-  if (confidence >= CONFIDENCE_MED_MIN) return "medium";
-  // Also catches NaN: every comparison above is false, so it is refunded.
+export interface ConfidenceTierThresholds {
+  highMin?: number;
+  mediumMin?: number;
+}
+
+export function confidenceTierWithThresholds(
+  confidence: number,
+  thresholds: ConfidenceTierThresholds = {},
+): ConfidenceTier {
+  const highMin = thresholds.highMin ?? CONFIDENCE_HIGH_MIN;
+  const mediumMin = thresholds.mediumMin ?? CONFIDENCE_MED_MIN;
+  if (confidence >= highMin) return "high";
+  if (confidence >= mediumMin) return "medium";
   return "low";
+}
+
+export function confidenceTier(confidence: number): ConfidenceTier {
+  return confidenceTierWithThresholds(confidence);
 }
 
 function tagged(tag: string, explanation: string): string {
@@ -79,16 +92,18 @@ function tagged(tag: string, explanation: string): string {
  * Apply the confidence tier to a verdict. Pure: returns a new payload (or the
  * same one when nothing changes) and never mutates its input.
  */
-export function tierVerdict(verdict: VerdictPayload): VerdictPayload {
+export function tierVerdictWithThresholds(
+  verdict: VerdictPayload,
+  thresholds: ConfidenceTierThresholds = {},
+): VerdictPayload {
   if (verdict.verdict === "UNRESOLVABLE" || verdict.verdict === "DRAW") return verdict;
 
-  const tier = confidenceTier(verdict.confidence);
+  const tier = confidenceTierWithThresholds(verdict.confidence, thresholds);
   if (tier === "high") return verdict;
   if (tier === "medium") {
     return { ...verdict, explanation: tagged(CONTESTED_TAG, verdict.explanation) };
   }
 
-  // Low confidence: refund rather than guess.
   return {
     verdict: "UNRESOLVABLE",
     confidence: verdict.confidence,
@@ -96,20 +111,32 @@ export function tierVerdict(verdict: VerdictPayload): VerdictPayload {
   };
 }
 
+export function tierVerdict(verdict: VerdictPayload): VerdictPayload {
+  return tierVerdictWithThresholds(verdict);
+}
+
 /** Cap confidence and tag the audit trail for non-API evidence. */
-export function applyFetcherTrust(
+export function applyFetcherTrustWithCap(
   verdict: VerdictPayload,
   fetcher: EvidenceFetcherKind | "none",
+  maxConfidence: number = MAX_CONFIDENCE_NON_API,
 ): VerdictPayload {
   if (fetcher === "coingecko-api") return verdict;
   if (verdict.verdict === "UNRESOLVABLE") return verdict;
-  const cappedConfidence = Math.min(verdict.confidence, MAX_CONFIDENCE_NON_API);
+  const cappedConfidence = Math.min(verdict.confidence, maxConfidence);
   const tag = fetcher === "jina" ? "[via-jina]" : fetcher === "direct" ? "[via-scrape]" : "[no-fetch]";
   return {
     ...verdict,
     confidence: cappedConfidence,
     explanation: tagged(tag, verdict.explanation),
   };
+}
+
+export function applyFetcherTrust(
+  verdict: VerdictPayload,
+  fetcher: EvidenceFetcherKind | "none",
+): VerdictPayload {
+  return applyFetcherTrustWithCap(verdict, fetcher);
 }
 
 /**

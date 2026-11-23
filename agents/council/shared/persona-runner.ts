@@ -24,6 +24,10 @@ import {
   type PersonaSpec,
   personaSecretEnv,
 } from "../personas";
+import {
+  claimStatementDigest,
+  peerReasoningCacheKey,
+} from "./peer-reasoning";
 import { getOrFetchEvidence } from "./evidence-cache";
 import { checkEvidenceFreshness } from "./evidence-freshness";
 import { evaluateClaimAsPersona, type PersonaVerdict } from "./persona-llm";
@@ -58,8 +62,12 @@ const throttleLlm = createThrottle(parsedConfig.config.llmThrottleMs);
 // Exported so tests can assert the cap without duplicating the constant.
 export const KELLY_CAP = 0.15;
 
-function peerReasoningKey(claimId: number, personaSlug: string): string {
-  return `${claimId}:${personaSlug}`;
+export function peerReasoningKey(
+  claimId: number,
+  personaSlug: string,
+  statementDigest?: string,
+): string {
+  return peerReasoningCacheKey(claimId, personaSlug, statementDigest);
 }
 
 function categoryMatches(persona: PersonaSpec, claim: ClaimOnChain): boolean {
@@ -131,11 +139,16 @@ export async function evaluatePersonaForClaim(
   let verdict: PersonaVerdict;
   try {
     await throttleLlm();
+    const digest = claimStatementDigest(claim);
+    const peerReads =
+      ctx.peerReasoning?.get(peerReasoningKey(claim.id, persona.slug, digest)) ??
+      ctx.peerReasoning?.get(peerReasoningKey(claim.id, persona.slug)) ??
+      [];
     verdict = await evaluateClaimAsPersona(
       persona,
       claim,
       evidence.text,
-      ctx.peerReasoning?.get(peerReasoningKey(claim.id, persona.slug)) ?? [],
+      peerReads,
     );
   } catch (err) {
     return {
@@ -171,7 +184,7 @@ export async function evaluatePersonaForClaim(
   }
 
   // Confident enough to stake. Size with Kelly, capped at 10% of bankroll.
-  // Note: the banzroll cap is enforced inside runPersonaForClaim where the
+  // Note: the bankroll cap is enforced inside runPersonaForClaim where the
   // wallet balance is read. Here we surface the base stake from the spec.
   return {
     shouldStake: true,
@@ -217,14 +230,14 @@ export async function runPersonaForClaim(
   // USDC bankroll — keep a 2x stake buffer so we never drain stakes dry. Fees are
   // XLM and separate, so staking cannot strand a persona for fees.
   const balances = await readAgentBalances(address);
-  const baseStakeUsdc = persona.stakeUsdc ?? DEFAULT_STAKE_USDC ;
+  const baseStakeUsdc = persona.stakeUsdc ?? DEFAULT_STAKE_USDC;
   if (balances.usdc === null) {
     console.log(`[council:${persona.slug}] no USDC trustline — run "npm run agents:fund"`);
     return null;
   }
   if (balances.usdc < baseStakeUsdc * 2) {
     console.log(
-      `[council:${persona.slug}] insufficient USK (account ${balances.usdc.toFixed(2)}), skipping`,
+      `[council:${persona.slug}] insufficient USDC (account ${balances.usdc.toFixed(2)}), skipping`,
     );
     return null;
   }
@@ -251,10 +264,10 @@ export async function runPersonaForClaim(
   // One signature. No approve leg: the invocation carries auth for exactly this
   // transfer of exactly this amount.
   const staked = await challengeClaim(wallet.signer, claim.id, stakeUsdc);
-  const txHash = staked.tyHash;
+  const txHash = staked.txHash;
 
   console.log(
-    `[council:${persona.slug}] ✓ Staked ${stakeUsdc} USDC, on claim #${claim.id} — ${staked.explorerUrl ?? tyHash}`,
+    `[council:${persona.slug}] ✓ Staked ${stakeUsdc} USDC, on claim #${claim.id} — ${staked.explorerUrl ?? txHash}`,
   );
   console.log(`[council:${persona.slug}]   ${decision.rationale.slice(0, 160)}`);
 

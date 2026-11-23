@@ -55,7 +55,7 @@ Base URL: `https://docs.xmtp.org`
 | File | Role |
 |------|------|
 | [`app/layout.tsx`](../app/layout.tsx) | `WalletProvider` wraps `{children}` + Toaster; the entire app tree has wallet context. |
-| [`lib/wallet.tsx`](../lib/wallet.tsx) | Context: `address`, `isConnected`, `connect`, `disconnect`, `error`; Stellar Wallets Kit on Stellar Testnet (connector picker; no chain-switch request exists on Stellar). |
+| [`lib/wallet.tsx`](../lib/wallet.tsx) | Context: `address`, `isConnected`, `connect`, `disconnect`, `error`, `sessionRevision`; Stellar Wallets Kit on Stellar Testnet (connector picker; no chain-switch request exists on Stellar). |
 
 **XMTP implication, and the one deliberate exception in this codebase:** XMTP's own
 auth handshake needs a protocol-level signing identity that is not Stellar-shaped,
@@ -208,17 +208,19 @@ Every failing state also sets `failure` (an `XmtpFailure` from `lib/xmtp/failure
 - **No claims** for user: empty state with CTA to Explore / Challenge.
 - **Claims but none XMTP-eligible** (not accepted 1v1, multi-challenger, etc.): notice + list with i18n reason.
 - **Active chats:** links to `/vs/[id]#mimir-xmtp-vs-chat` for claims passing `canOpenVsXmtpChat`.
+- The hub reports wallet message-signing capability separately from XMTP transport state. A wallet that cannot sign the one-time XMTP identity setup is not reported as a transport outage.
+- Privacy boundary: message text is end-to-end encrypted and sent through XMTP, not received or stored by Mimir. XMTP may retain encrypted messages; duel state and wallet addresses remain public on-chain, and the peer can read sent messages.
 
 ## 12. Step 7 — Done ✓ (optimistic send)
 
 | Deliverable | Location |
 |-------------|----------|
 | Remote + pending message merge | [`lib/xmtp/optimistic-send.ts`](../lib/xmtp/optimistic-send.ts) — `mergeThreadDisplayRows`, `OptimisticPendingMessage` |
-| Panel | [`components/xmtp/VsXmtpPanel.tsx`](../components/xmtp/VsXmtpPanel.tsx) — draft cleared on send, `sendText(text, true)`, dedup by `serverMessageId` vs stream |
+| Panel | [`components/xmtp/VsXmtpPanel.tsx`](../components/xmtp/VsXmtpPanel.tsx) — draft cleared on send, acknowledgement-aware `sendText(text, true)`, dedup by `serverMessageId` vs stream |
 
 **Behavior**
 - Message bubble appears instantly; SDK sends with `isOptimistic: true`.
-- After `sendText`, the returned ID is saved; when the thread stream receives the same `DecodedMessage.id`, the pending row is removed (no duplicate).
+- Before transport acknowledgement, the bubble says **Sending**. Only after `sendText` resolves does it say XMTP accepted the message; this is not a claim that the peer received or read it. When the thread stream receives the same `DecodedMessage.id`, the pending row is removed (no duplicate).
 - Send failure: pending row removed and a `send_failed` notice appears **with the text restored to the draft**, so a failed message can be resent instead of being retyped.
 
 ---

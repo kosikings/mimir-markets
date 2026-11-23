@@ -34,6 +34,10 @@ pub enum DataKey {
     Usdc,
     Policy,
     Pending,
+    /// Active fee-policy revision when the current pending policy was queued.
+    /// Kept separate from `PendingFeePolicy` so adding this guard does not
+    /// change the serialized shape of an already queued policy.
+    PendingPolicyBaseRevision,
     /// Queued oracle rotation (separate from fee-policy Pending).
     PendingOracle,
     ClaimCount,
@@ -70,6 +74,13 @@ pub enum DataKey {
     CreatorClaims(Address, u32),
     /// Per-creator total claim count, used to derive the page layout.
     CreatorClaimCount(Address),
+    /// Per-claim transition history head: newest sequence number and whether
+    /// recording started at creation. See `claim_history`.
+    ClaimHistoryHead(u64),
+    /// One recorded claim transition, keyed by its stable identity
+    /// `(claim_id, seq)`. One entry per transition keeps a history read
+    /// O(page) instead of O(challengers).
+    ClaimHistoryEntry(u64, u32),
 }
 
 /// Persistent entries are bumped to roughly 30 days of ledgers on touch so an
@@ -148,6 +159,10 @@ pub fn set_fee_policy(env: &Env, policy: &FeePolicy) {
     env.storage().instance().set(&DataKey::Policy, policy);
 }
 
+pub fn fee_policy_revision(env: &Env) -> Result<u64, Error> {
+    Ok(fee_policy(env)?.revision)
+}
+
 pub fn pending_fee_policy(env: &Env) -> Option<PendingFeePolicy> {
     env.storage().instance().get(&DataKey::Pending)
 }
@@ -156,8 +171,23 @@ pub fn set_pending_fee_policy(env: &Env, pending: &PendingFeePolicy) {
     env.storage().instance().set(&DataKey::Pending, pending);
 }
 
+pub fn pending_fee_policy_base_revision(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PendingPolicyBaseRevision)
+}
+
+pub fn set_pending_fee_policy_base_revision(env: &Env, revision: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingPolicyBaseRevision, &revision);
+}
+
 pub fn clear_pending_fee_policy(env: &Env) {
     env.storage().instance().remove(&DataKey::Pending);
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingPolicyBaseRevision);
 }
 
 pub fn pending_oracle(env: &Env) -> Option<PendingOracle> {
@@ -303,6 +333,11 @@ pub fn get_claim_opt(env: &Env, id: u64) -> Option<Claim> {
         }
         None => None,
     }
+}
+
+/// Whether a claim entry exists, without deserializing it or bumping its TTL.
+pub fn has_claim(env: &Env, id: u64) -> bool {
+    env.storage().persistent().has(&DataKey::Claim(id))
 }
 
 pub fn set_claim(env: &Env, id: u64, claim: &Claim) {
